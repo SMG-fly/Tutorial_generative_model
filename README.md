@@ -7,7 +7,7 @@
 - tokenizer: RNN_tokenizer.pkl 사용
 - input: smiles sequence
 - output: Mollogp 예측 (Regression)
-- Mollogp?
+- Mollogp? 분자의 지용성 (lipophilicity) 을 나타내는 지표. 값이 높을수록 지용성, 낮을수록 수용성.
 ![image](https://github.com/user-attachments/assets/902a0295-9dc9-43cd-8ad0-61e1a351d2d5)
 ## Results
 ### wandb(train)
@@ -36,9 +36,11 @@
 
 ### 생성 결과
 - 5epoch
+
 ![image](https://github.com/user-attachments/assets/c5c84f39-a164-4021-9b70-5cdde44ea703)
 
 - 100epoch
 
 유의미한 결과를 도출하기 위해 더 큰 규모의 학습을 해야 할 것으로 보인다.
+
 cdf 기반의 latent space sampling 함수를 제작을 시도해보자.
