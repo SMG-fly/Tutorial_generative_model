@@ -9,6 +9,10 @@
 - output: Mollogp 예측 (Regression)
 - Mollogp?
 ![image](https://github.com/user-attachments/assets/902a0295-9dc9-43cd-8ad0-61e1a351d2d5)
+### wandb(train)
+![image](https://github.com/user-attachments/assets/2fa2d904-1279-4ca8-b676-6908fe216988)
+
+
 
 # 2. VAE model
 - dataset: smiles.txt
@@ -21,3 +25,19 @@
 ## test
 - input: sampled latent vector
 - output: generated smiles seqeunce
+
+## Results
+### wandb(train)
+- VAE-training: 5epoch 돌린 결과
+- VAE-training-2: 100epoch 돌린 결과
+  ![image](https://github.com/user-attachments/assets/22b63a57-daca-4fa3-a099-c7f56941715d)
+
+
+### 생성 결과
+- 5epoch
+![image](https://github.com/user-attachments/assets/c5c84f39-a164-4021-9b70-5cdde44ea703)
+
+- 100epoch
+
+유의미한 결과를 도출하기 위해 더 큰 규모의 학습을 해야 할 것으로 보인다.
+cdf 기반의 latent space sampling 함수를 제작을 시도해보자.
