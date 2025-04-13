@@ -9,6 +9,7 @@
 - output: Mollogp 예측 (Regression)
 - Mollogp?
 ![image](https://github.com/user-attachments/assets/902a0295-9dc9-43cd-8ad0-61e1a351d2d5)
+## Results
 ### wandb(train)
 ![image](https://github.com/user-attachments/assets/2fa2d904-1279-4ca8-b676-6908fe216988)
 
