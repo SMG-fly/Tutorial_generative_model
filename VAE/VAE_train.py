@@ -276,9 +276,6 @@ def main():
 
     # Prepare model 
     model = SmVAE(vocab_size=len(tokenizer), embedding_dim=128, hidden_dim=128, latent_dim=128, num_rnn_layers=3)
-
-    
-    # # GPU 번호 지정
     model.to(device)
 
     # Optimizer 설정
