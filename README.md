@@ -34,7 +34,7 @@
   ![image](https://github.com/user-attachments/assets/22b63a57-daca-4fa3-a099-c7f56941715d)
 
 
-### 생성 결과
+### Inference 결과
 - 5epoch
 
 ![image](https://github.com/user-attachments/assets/c5c84f39-a164-4021-9b70-5cdde44ea703)
