@@ -41,6 +41,9 @@
 
 - 100epoch
 
+![image](https://github.com/user-attachments/assets/e32ec862-a817-48fa-8429-e527ff9bcd30)
+
+
 유의미한 결과를 도출하기 위해 더 큰 규모의 학습을 해야 할 것으로 보인다.
 
-cdf 기반의 latent space sampling 함수를 제작을 시도해보자.
+
