@@ -286,6 +286,8 @@ def main():
     optimizer = AdamW(model.parameters(), lr=args.learning_rate)
 
     # checkpoint 불러오기
+    global_step = 0
+    start_epoch = 0
     if args.checkpoint_path:
         checkpoint = torch.load(args.checkpoint_path, map_location=device)
 
@@ -310,7 +312,7 @@ def main():
         print("[WandB] Run name not provided. WandB logging will be skipped.")
 
     # 모델 학습 실행
-    train(model, dataloaders["train"], dataloaders["valid"], optimizer, device, args, start_epoch=0, global_step=0)
+    train(model, dataloaders["train"], dataloaders["valid"], optimizer, device, args, start_epoch=start_epoch, global_step=global_step)
 
 if __name__ =="__main__":
     main()

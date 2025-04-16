@@ -69,9 +69,15 @@ class SmDecoder(nn.Module):
 
             # Decide next input
             teacher_force = torch.rand(1).item() < teacher_forcing_ratio
-            next_input = target_tokens[:, t] if teacher_force else logits.argmax(dim=1) # To do: Modify logit.argmax -> softmax sampling
-            input_tokens = next_input.unsqueeze(1) # [batch_size, 1]
+            
+            if teacher_force:
+                next_input = target_tokens[:, t].unsqueeze(1)
+            else:
+                # Softmax sampling
+                probs = nn.functional.softmax(logits, dim=1)
+                next_input = torch.multinomial(probs, num_samples=1)  # [batch_size, 1] # sample from the distribution
 
+            input_tokens = next_input # [batch_size, 1] # <sos> token
         return torch.stack(output_logits, dim=1) # [batch_size, seq_len-1, vocab_size]
     
     def generate(self, latent_vector: torch.Tensor, max_length: int, start_token_idx: int = 1, end_token_idx: int = 2) -> torch.Tensor:
