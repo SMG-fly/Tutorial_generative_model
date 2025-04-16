@@ -69,7 +69,7 @@ class SmDecoder(nn.Module):
 
             # Decide next input
             teacher_force = torch.rand(1).item() < teacher_forcing_ratio
-            next_input = target_tokens[:, t] if teacher_force else logits.argmax(dim=1) # Decide whether to write the actual correct token as the next input or the token predicted by the model.
+            next_input = target_tokens[:, t] if teacher_force else logits.argmax(dim=1) # To do: Modify logit.argmax -> softmax sampling
             input_tokens = next_input.unsqueeze(1) # [batch_size, 1]
 
         return torch.stack(output_logits, dim=1) # [batch_size, seq_len-1, vocab_size]
@@ -83,18 +83,20 @@ class SmDecoder(nn.Module):
         c_0 = torch.zeros_like(h_0)  # same shape
         hidden_state = (h_0, c_0)
         
-        input_tokens = torch.full((batch_size, 1), start_token_idx, dtype=torch.long).to(latent_vector.device) # [batch_size, 1] # <sos> token # torch.long: 64-bit integer
+        input_token = torch.full((batch_size, 1), start_token_idx, dtype=torch.long).to(latent_vector.device) # [batch_size, 1] # <sos> token # torch.long: 64-bit integer
         generated_sequence = []
 
         for _ in range(max_length):
-            input_embedding = self.embedding_layer(input_tokens) # [batch_size, input_token_length, embedding_dim] # input_token_length = 1
+            input_embedding = self.embedding_layer(input_token) # [batch_size, input_token_length, embedding_dim] # input_token_length = 1
             lstm_output, hidden_state = self.lstm_decoder(input_embedding, hidden_state) # lstm_output: [batch_size, 1, hidden_dim]
             logits = self.output_projection(lstm_output.squeeze(1))  # [batch_size, vocab_size]
             
-            next_token = logits.argmax(dim=1, keepdim=True)  # [batch_size, 1]
-            generated_sequence.append(next_token)
-            
-            input_tokens = next_token
+            # Softmax sampling
+            probs = nn.functional.softmax(logits, dim=1)
+            next_token = torch.multinomial(probs, num_samples=1)  # [batch_size, 1] # sample from the distribution
+
+            generated_sequence.append(next_token)            
+            input_token = next_token
 
             if (next_token == end_token_idx).all(): # all samples generate <eos> token -> stop generation # To do: where is <pad>?
                 break

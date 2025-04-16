@@ -28,7 +28,7 @@ def parse_arguments():
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for optimizer")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save model checkpoints")
-    parser.add_argument("--data_path", type=str, required=True, help="Path to training dataset(parquet)")
+    parser.add_argument("--data_path", type=str, required=True, help="Path to training dataset")
     parser.add_argument("--checkpoint_path", type=str, default=None, help="Path to model checkpoint for resuming training")
     parser.add_argument("--cuda_device", type=int, default=None, help="CUDA device number to use")
     parser.add_argument("--tokenizer_path", type=str, required=True, help="Path to tokenizer directory")
@@ -37,6 +37,8 @@ def parse_arguments():
     parser.add_argument("--max_len", type=int, default=64)
     parser.add_argument("--num_data", type=int, default=20000)
     parser.add_argument("--kl_ratio", type=float, default=10.0)
+    parser.add_argument("--teacher_forcing_ratio", type=float, default=0.5)
+    parser.add_argument("--tqdm", action="store_true", help="Show tqdm progress bar")
     return parser.parse_args()
 
 # Set seed
@@ -156,13 +158,12 @@ def save_checkpoint(model, optimizer, epoch, step, loss, output_dir, filename="s
         torch.save(checkpoint, f"{output_dir}/final_model.pt")
 
 # 학습 함수
-def train(model, train_dataloader, valid_dataloader, optimizer, device, args):
+def train(model, train_dataloader, valid_dataloader, optimizer, device, args, start_epoch=0, global_step=0):
     # model.train() # Activate when not valid per epoch
-    global_step = 0
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train() # Activate when valid per epoch
         start = time.time()
-        loop = tqdm(train_dataloader, leave=True)
+        loop = tqdm(train_dataloader, leave=True, disable=not args.tqdm)
 
         recon_loss_list, kl_loss_list = [], []
 
@@ -170,7 +171,7 @@ def train(model, train_dataloader, valid_dataloader, optimizer, device, args):
             input_batch = batch["seq"].to(device)
             length_batch = batch["length"].to(device)
 
-            logits, mean, logvar = model(input_token_indices=input_batch, teacher_forcing_ratio=0.5) # [batch_size, max_len, vocab_size]
+            logits, mean, logvar = model(input_token_indices=input_batch, teacher_forcing_ratio=args.teacher_forcing_ratio) # [batch_size, max_len, vocab_size]
             recon_loss, kl_loss = model.compute_loss(logits, input_batch, mean, logvar, length_batch) # [batch_size, max_len]
             loss = recon_loss + args.kl_ratio * kl_loss
 
@@ -220,7 +221,7 @@ def validate(model, dataloader, device, epoch, args):
         length_batch = batch["length"].to(device)
 
         # 모델 Forward & Loss 계산
-        logits, mean, logvar = model(input_token_indices=input_batch, teacher_forcing_ratio=0.5) # [batch_size, max_len, vocab_size]
+        logits, mean, logvar = model(input_token_indices=input_batch, teacher_forcing_ratio=args.teacher_forcing_ratio) # [batch_size, max_len, vocab_size]
         recon_loss, kl_loss = model.compute_loss(logits, input_batch, mean, logvar, length_batch) # [batch_size, max_len]
         total_loss = recon_loss + args.kl_ratio * kl_loss
 
@@ -263,9 +264,12 @@ def main():
     print(f'index of <pad>: {tokenizer["X"]}')
 
     # Split data # To do: Modify to train_test_split
-    train_data = SMILESDataset(smiles_list[:16000], tokenizer)
-    valid_data = SMILESDataset(smiles_list[16000:18000], tokenizer)
-    test_data = SMILESDataset(smiles_list[18000:20000], tokenizer)
+    #train_data = SMILESDataset(smiles_list[:16000], tokenizer)
+    #valid_data = SMILESDataset(smiles_list[16000:18000], tokenizer)
+    #test_data = SMILESDataset(smiles_list[18000:20000], tokenizer)
+    valid_data = SMILESDataset(smiles_list[1:1000], tokenizer)
+    test_data = SMILESDataset(smiles_list[1000:2000], tokenizer)
+    train_data = SMILESDataset(smiles_list[2000:], tokenizer)
    
     # DataLoader
     dataloaders = {
@@ -283,10 +287,14 @@ def main():
 
     # checkpoint 불러오기
     if args.checkpoint_path:
-        checkpoint = torch.load(args.checkpoint_path, map_location=f"cuda:{args.cuda_device}")
+        checkpoint = torch.load(args.checkpoint_path, map_location=device)
 
         if "model_state_dict" in checkpoint:
             model.load_state_dict(checkpoint["model_state_dict"]) # checkpoint에 state_dict외 다른 것도 포함된 경우
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            start_epoch = checkpoint.get("epoch", 0)
+            global_step = checkpoint.get("step", 0)
+            print(f"Resumed from checkpoint at epoch {start_epoch}, step {global_step}")
         else:
             model.load_state_dict(checkpoint)  # 직접 불러오기 (state_dict만 저장된 경우)
 
@@ -302,7 +310,7 @@ def main():
         print("[WandB] Run name not provided. WandB logging will be skipped.")
 
     # 모델 학습 실행
-    train(model, dataloaders["train"], dataloaders["valid"], optimizer, device, args)
+    train(model, dataloaders["train"], dataloaders["valid"], optimizer, device, args, start_epoch=0, global_step=0)
 
 if __name__ =="__main__":
     main()
