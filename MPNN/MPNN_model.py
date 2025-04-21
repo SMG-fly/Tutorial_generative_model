@@ -10,6 +10,11 @@ class SmMessagePassing(MessagePassing):
         self.update_mlp = Sequential(Linear(hidden_dim, hidden_dim), ReLU()) # About node features
 
     def forward(self, x, edge_index, edge_attr):
+        ##### 이런식으로 해주면 update에도 x_i가 전달될 수 있다. ##### 
+        # x_i = x[edge_index[0]]
+        # updated_node_features = self.propagate(edge_index=edge_index, x=x, edge_attr=edge_attr, x_i=x_i)
+        #########################################################
+
         updated_node_features = self.propagate(edge_index=edge_index, x=x, edge_attr=edge_attr) # In propagate(), message() -> aggregate() -> update()
         return updated_node_features 
         
@@ -17,12 +22,12 @@ class SmMessagePassing(MessagePassing):
         # x_j: node features of the source nodes (neighbors)
         # edge_attr: edge features
         # Concatenate node features and edge features
-        #messages = self.message_mlp(torch.cat([x_i, x_j, edge_attr], dim=-1)) # 이건 왜 안 되는 걸까?
+        #messages = self.message_mlp(torch.cat([x_i, x_j, edge_attr], dim=-1)) # message()에는 x_i, x_j가 자동으로 전달됨
         messages = self.message_mlp(torch.cat([x_j, edge_attr], dim=-1)) # [num_edges, 2 * hidden_dim] -> [num_edges, hidden_dim]
         return messages
 
     def update(self, aggr_out):
-        #updated_node_features = self.update_mlp(torch.cat([x_i, aggr_out], dim=-1)) 
+        #updated_node_features = self.update_mlp(torch.cat([x_i, aggr_out], dim=-1)) # 하지만, update()에는 aggr_out만 전달됨 -> 인자 추가 시 propagate()에서 전달해야 함
         updated_node_features = self.update_mlp(torch.cat([aggr_out], dim=-1)) 
         return updated_node_features
     

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J SMG_MPNN_train_1
+#SBATCH -J SMG_MPNN_test_LogP
 #SBATCH -p 2080ti
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -14,4 +14,10 @@ conda activate bindenv
 
 ##### Main run #####
 cd ~/tutorial_model
-python3 MPNN_train.py --smiles_path ./smiles.txt --graph_path ./Result_MPNN/preprocessed_smiles_graph.pt --target logP --batch_size 128 --ckpt_out_dir ./Checkpoints/MPNN-logP --num_data 200000 --split_path ./Result_MPNN/split_indices.pkl --wandb_name MPNN-training-logp-1
+python3 MPNN_test.py \
+  --graph_path ./Result_MPNN/preprocessed_smiles_graph.pt \
+  --smiles_path ./smiles.txt \
+  --split_path ./Result_MPNN/split_indices-LogP-1.pkl \
+  --ckpt_path ./Result_MPNN/Checkpoints/MPNN_logP_epoch_49.pt \
+  --target logP \
+  --threshold 2.5

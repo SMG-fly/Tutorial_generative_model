@@ -233,7 +233,7 @@ def main():
         print("[WandB] Run name not provided. WandB logging will be skipped.")
 
     # 모델 학습 실행
-    train(model, data_loaders["train"], data_loaders["valid"], optimizer, loss_fn, device, args, start_epoch=0, global_step=0)
+    train(model, data_loaders["train"], data_loaders["valid"], optimizer, loss_fn, device, args, start_epoch=start_epoch, global_step=global_step)
 
     # Save final model
     

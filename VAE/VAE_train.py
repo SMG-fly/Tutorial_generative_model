@@ -247,7 +247,7 @@ def validate(model, dataloader, device, epoch, args):
 def main():
     # Setting
     args = parse_arguments()
-    set_seed(42) 
+    #set_seed(42) 
 
     if args.cuda_device:
         device = torch.device(f"cuda:{args.cuda_device}" if torch.cuda.is_available() else "cpu")
