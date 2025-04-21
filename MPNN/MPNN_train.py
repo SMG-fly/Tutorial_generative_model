@@ -117,14 +117,14 @@ def train(model, train_dataloader, valid_dataloader, optimizer, loss_fn, device,
 
             global_step += 1
                 
-        epoch_train_avg_loss = np.sum(np.array(train_loss_list)) / len(train_dataloader.dataset) # To do: 계산 맞는지 확인... reduction이 sum에서 mean으로 바꼈는데 그대로인 게 더 이상하지 않아? # divide by the number of dataset samples, not batch samples 
+        epoch_train_avg_loss = np.mean(train_loss_list) # To do: 계산 맞는지 확인... reduction이 sum에서 mean으로 바꼈는데 그대로인 게 더 이상하지 않아? # divide by the number of dataset samples, not batch samples 
         train_loss_history.append(epoch_train_avg_loss)
         validate(model, valid_dataloader, loss_fn, device, epoch)
-        save_checkpoint(model, optimizer, epoch, global_step, loss, args.ckpt_out_dir, "epoch")
+        save_checkpoint(model, optimizer, epoch, global_step, epoch_train_avg_loss, "epoch")
         print(f"Epoch {epoch + 1} Loss: {epoch_train_avg_loss:.4f} Time: {time.time() - start:.2f}s")
 
     # Save final model
-    save_checkpoint(model, optimizer, args.epochs, global_step, loss, args.ckpt_out_dir, "final")
+    save_checkpoint(model, optimizer, args.epochs, global_step, epoch_train_avg_loss, args.ckpt_out_dir, "final")
 
 
 # Validation
@@ -150,7 +150,7 @@ def validate(model, dataloader, loss_fn, device, epoch):
                 "batch_idx": batch_idx
             })
 
-    epoch_valid_avg_loss = np.sum(np.array(valid_loss_list)) / len(dataloader.dataset) # divide by the number of dataset samples, not batch samples
+    epoch_valid_avg_loss = np.mean(valid_loss_list) # divide by the number of dataset samples, not batch samples
     valid_loss_history.append(epoch_valid_avg_loss)
     if epoch_valid_avg_loss < best_valid_loss:
         best_epoch = epoch +1 
@@ -203,7 +203,7 @@ def main():
     edge_dim = full_dataset[0].edge_attr.shape[1]
 
     model = SmMPNN(node_dim=node_dim, edge_dim=edge_dim, hidden_dim=args.hidden_dim).to(device)
-    loss_fn = nn.MSELoss(reduction="sum")
+    loss_fn = nn.MSELoss(reduction="mean")
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
     # Load checkpoint if provided
