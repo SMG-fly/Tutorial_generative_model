@@ -1,4 +1,4 @@
-![image](https://github.com/user-attachments/assets/eed0ef47-e3d4-4076-b716-16c206339e3e)# Tutorial_generative_model
+# Tutorial_generative_model
 
 모든 코드는 ```python3 scripts.py -h``` 하면 어떤 명령어를 입력해야 할지 알 수 있다. 
 
@@ -60,17 +60,17 @@
 softmax sampling으로 변경한 결과 다양한 smiles 식이 나오기 시작했지만, 여전히 valid한 분자는 하나도 나오지 않았다. 
 
 # 3. MPNN
-dataset: smiles.txt
-output: molecular properties (logP, QED)
+- dataset: smiles.txt
+- output: molecular properties (logP, QED)
 
 ## Preprocessing
-input: smiles.txt
-output: graph.pt
-script: MPNN_preprocess.py
+- input: smiles.txt
+- output: graph.pt
+- script: MPNN_preprocess.py
 
 ## train & test
-input: graph.pt
-output: molecular properties (logP, QED)
+- input: graph.pt
+- output: molecular properties (logP, QED)
 
 ## Result
 ### wandb
