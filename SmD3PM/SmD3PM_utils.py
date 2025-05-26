@@ -2,6 +2,13 @@ import numpy as np
 import torch
 from torchmetrics import Metric, MeanSquaredError
 
+import os
+import wandb
+import omegaconf
+import torch.nn as nn
+import torch.nn.functional as F
+from torchmetrics import Metric
+
 # Utils --------------------------------
 class PlaceHolder: # To do: Check And Modify argmax
     def __init__(self, X, y=None):
@@ -37,6 +44,31 @@ class PlaceHolder: # To do: Check And Modify argmax
                 if self.y.dim() ==3: # (B, L, V)
                     self.y = self.y * pad_mask.unsqueeze(-1) 
         return self
+
+def setup_wandb(cfg):
+    config_dict = omegaconf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True) # .yaml 파일을 python dict로 변환
+    kwargs = {'name': cfg.general.name, 'project': f'graph_ddm_{cfg.dataset.name}', 'config': config_dict, # wandb.init()에 전달할 설정 값
+              'settings': wandb.Settings(_disable_stats=True), 'reinit': True, 'mode': cfg.general.wandb}
+    wandb.init(**kwargs)
+    wandb.save('*.txt') # To do: Check whethere this is necessary # maybe memory waste
+
+def update_config_with_new_keys(cfg, saved_cfg):
+    # 중요한 keys만 명시적으로 병합
+    for section in ['general', 'train', 'model']:
+        omegaconf.OmegaConf.set_struct(getattr(cfg, section), True) # 구조 고정 모드 → 새로운 key를 직접 추가하면 에러가 나게 설정 # 전체 구조 보호
+        with omegaconf.open_dict(getattr(cfg, section)): # 위 구조고정을 with open_dict(...) 안에서만 일시적으로 해제해서 수동으로 key를 넣을 수 있게 해줌
+            for key, value in getattr(saved_cfg, section).items():
+                if key not in getattr(cfg, section).keys(): # ckpt에 있는 key가 test의 cfg에 없으면 # 이미 존재하는 key는 덮어쓰지 않음 (덮으면 위험할 수 있으니까)
+                    setattr(getattr(cfg, section), key, value) # cfg.section.key = value와 같은 역할 # python 내장 함수 
+
+    return cfg # 업데이트된 cfg 반환
+
+def create_folders(cfg): # 필요한 folder를 미리 만들어두는 함수 # To do: customize
+    os.makedirs(os.path.join('checkpoints', cfg.general.name), exist_ok=True)
+
+    # 필요한 경우만
+    if cfg.general.save_chain_steps:
+        os.makedirs(os.path.join('chains', cfg.general.name), exist_ok=True)
 
 # Diffusion Utils ----------------------
 
@@ -282,3 +314,242 @@ class NLL(Metric):
 
     def compute(self) -> torch.Tensor:
         return self.total_nll / self.total_samples
+
+class CrossEntropyMetric(Metric):
+    def __init__(self):
+        super().__init__()
+        self.add_state('total_ce', default=torch.tensor(0.), dist_reduce_fx="sum")
+        self.add_state('total_samples', default=torch.tensor(0.), dist_reduce_fx="sum")
+
+    def update(self, preds: torch.Tensor, targets: torch.Tensor) -> None: # In training phase, pred : \hat{x}_0, target : x_0
+        """ 
+        Update state with predictions and targets.
+        preds: (B, L, V) # softmax된 확률 분포
+        targets: (B, L, V) # Ground Truth values 
+        """
+        target = torch.argmax(target, dim=-1) # target도 분포로 받나봐... 근데 굳이 argmax로 해줘야 하나? 그냥 분포끼리 비교하는 게 더 낫지 않나? # To do: Check
+        output = F.cross_entropy(preds, target, reduction='sum') # (B, L) # 각 위치에서의 cross entropy loss
+        self.total_ce += output
+        self.total_samples += preds.size(0)
+
+    def compute(self):
+        return self.total_ce / self.total_samples
+
+# Train metrics ----------------------
+class TrainLossDiscrete(nn.Module):
+    """ Train with Cross Entropy Loss """
+    def __init__(self, lambda_train): # lambda_train: loss_x, loss_y 비율 조정
+        super().__init__()
+        self.X_loss = CrossEntropyMetric()
+        self.y_loss = CrossEntropyMetric()
+        self.lambda_train = lambda_train
+    
+    def forward(self, masked_pred_X, pred_y, true_X, true_y, log: bool):
+        """ 
+        Compute train metrics
+        masked_pred_X : tensor -- (bs, n, dx)
+        pred_y : tensor -- (bs, )
+        true_X : tensor -- (bs, n, dx)
+        true_y : tensor -- (bs, )
+        log : boolean. 
+        """
+        # To do: 아래 부분 아직 분석 안 함. 이해하고 아래 reset으로 넘어가기
+        true_X = torch.reshape(true_X, (-1, true_X.size(-1)))  # (bs * n, dx) # 마지막 차원 유지, 앞 차원은 자동 계산 # 시퀀스 전체를 token 단위로 비교하기 위해
+        masked_pred_X = torch.reshape(masked_pred_X, (-1, masked_pred_X.size(-1)))  # (bs * n, dx)
+
+        # Remove masked rows
+        mask_X = (true_X != 0.).any(dim=-1) # Vocab 차원에서 0이 아닌 값이 하나라도 있으면 True # pred는 이미 masking 되어 있어서 필요 없음 
+
+        flat_true_X = true_X[mask_X, :]
+        flat_pred_X = masked_pred_X[mask_X, :]
+
+        loss_X = self.X_loss(flat_pred_X, flat_true_X) if true_X.numel() > 0 else 0.0 # numel: tensor 안에 있는 모든 원소의 개수를 반환하는 함수 # 데이터가 없으면 0으로 대체
+        loss_y = self.y_loss(pred_y, true_y) if true_y.numel() > 0 else 0.0 # To do: Check # y는 전처리 필요 없나?
+
+        if log:
+            to_log = {"train_loss/batch_CE": (loss_X + loss_y).detach(),
+                      "train_loss/X_CE": self.X_loss.compute() if true_X.numel() > 0 else -1,
+                      "train_loss/y_CE": self.y_loss.compute() if true_y.numel() > 0 else -1}
+            if wandb.run:
+                wandb.log(to_log, commit=True)
+        return loss_X + self.lambda_train * loss_y 
+
+    def reset(self):
+        for metric in [self.X_loss, self.y_loss]:
+            metric.reset() # torchmetrics.Metric의 reset() 메서드 호출
+
+    def log_epoch_metrics(self):
+        epoch_node_loss = self.X_loss.compute() if self.X_loss.total_samples > 0 else -1 # total ce (mean) 도출
+        epoch_y_loss = self.y_loss.compute() if self.y_loss.total_samples > 0 else -1 
+
+        to_log = {"train_epoch/x_CE": epoch_node_loss,
+                  "train_epoch/y_CE": epoch_y_loss}
+        if wandb.run:
+            wandb.log(to_log, commit=False)
+
+        return to_log
+
+
+# spectre_utils.py --------------------
+class TrainSequenceMetrics: # 아니 근데 이러면 앞에 했던 것들이랑 중복 아닌가? 그리고 이 함수도 확인 후 수정 필요 # To do: check
+    def __init__(self, dataset_infos):
+        self.pad_token_idx = dataset_infos.pad_token_idx
+        self.vocab_size = dataset_infos.vocab_size
+        self.reset() # 이거 내장 함수야?
+
+    def reset(self):
+        self.total_loss = 0.0
+        self.total_tokens = 0
+        self.correct_tokens = 0
+
+    def update(self, pred_logits, x_0, pad_mask): # model에서 다 계산을 해놨을텐데 왜 이렇게 하는 거지? # To do: check
+        """
+        pred_logits: (B, L, V)
+        x_0: (B, L)
+        pad_mask: (B, L) where 1 = real token, 0 = pad
+        """
+        B, L, V = pred_logits.shape
+
+        # flatten
+        logits = pred_logits.view(-1, V)       # (B*L, V)
+        targets = x_0.view(-1)                 # (B*L,)
+        mask = pad_mask.view(-1).bool()        # (B*L,)
+
+        # loss
+        loss = F.cross_entropy(logits[mask], targets[mask], reduction='sum')
+        self.total_loss += loss.item()
+
+        # accuracy
+        preds = logits.argmax(dim=-1)          # (B*L,)
+        correct = (preds == targets) & mask
+        self.correct_tokens += correct.sum().item()
+        self.total_tokens += mask.sum().item()
+
+    def compute(self):
+        avg_loss = self.total_loss / max(self.total_tokens, 1)
+        acc = self.correct_tokens / max(self.total_tokens, 1)
+        return {
+            "train/loss": avg_loss,
+            "train/acc": acc,
+            "train/tokens": self.total_tokens
+        }
+    
+    
+class SamplingSequenceMetrics: # 이 함수도 확인 후 수정 필요 # To do: check
+    def __init__(self, dataset_infos, reference_set=None):
+        self.tokenizer = dataset_infos.inverse_tokenizer  # index → token
+        self.pad_token_idx = dataset_infos.pad_token_idx
+        self.vocab_size = dataset_infos.vocab_size
+        self.reference_set = set(reference_set or [])
+        self.reset()
+
+    def reset(self):
+        self.decoded = []
+        self.valid_set = set()
+        self.total = 0
+
+    def decode_sequence(self, idx_seq):
+        # idx_seq: (L,)
+        tokens = [self.tokenizer.get(idx, '') for idx in idx_seq if idx != self.pad_token_idx]
+        return ''.join(tokens)
+
+    def update(self, generated_batch):
+        """
+        generated_batch: Tensor (B, L)
+        """
+        for i in range(generated_batch.size(0)):
+            seq = generated_batch[i].tolist()
+            decoded = self.decode_sequence(seq)
+            self.total += 1
+            self.decoded.append(decoded)
+            if self.is_valid(decoded):
+                self.valid_set.add(decoded)
+
+    def is_valid(self, seq: str):
+        # 예시: SMILES 유효성 검사 → RDKit 또는 길이 기준 등
+        return len(seq) > 0 and all(c.isalnum() or c in "=#()" for c in seq)
+
+    def compute(self):
+        total = self.total
+        valid = len(self.valid_set)
+        unique = len(set(self.decoded))
+
+        novelty = 0
+        if self.reference_set:
+            novel_set = set(self.decoded) - self.reference_set
+            novelty = len(novel_set) / total
+
+        return {
+            "sampling/validity": valid / total,
+            "sampling/uniqueness": unique / total,
+            "sampling/novelty": novelty,
+            "sampling/total": total
+        }
+
+
+# extra_features ----------------------
+class DummyExtraFeatures:
+    def __init__(self):
+        """ This class does not compute anything, just returns empty tensors."""
+
+    def __call__(self, noisy_data):
+        X = noisy_data['X_t']
+        y = noisy_data['y_t']
+        empty_x = X.new_zeros((*X.shape[:-1], 0)) # 이렇게 empty tensor를 줘도 되는 거야? 기존 x값까지 지워지겠어. extra라서 상관없나?
+        empty_y = y.new_zeros((y.shape[0], 0))
+        return PlaceHolder(X=empty_x, y=empty_y)
+
+
+class ExtraFeatures: # To do: Check and modify
+    def __init__(self, features_type: str, dataset_info):
+        self.features_type = features_type
+        self.max_length = dataset_info.max_seq_len
+
+    def __call__(self, noisy_data):
+        """
+        Input:
+            - noisy_data['X_t']: (B, L)      # tokenized input
+            - noisy_data['pad_mask']: (B, L)
+            - noisy_data['y_t']: (B, D)      # ex: logP, label
+        Output:
+            - PlaceHolder with X, E, y
+        """
+        X_t = noisy_data['X_t']
+        pad_mask = noisy_data['pad_mask']
+        y_t = noisy_data['y_t']  # logP (B, 1) or other label (B, D)
+        B, L = X_t.shape
+
+        seq_lens = pad_mask.sum(dim=1, keepdim=True).float()  # (B, 1)
+        length_ratio = seq_lens / self.max_length             # (B, 1)
+
+        # -------- Feature type 분기 -------- #
+        if self.features_type == 'length':
+            return PlaceHolder(
+                X=X_t.new_zeros((B, L, 0)),
+                E=None,
+                y=length_ratio  # (B, 1)
+            )
+
+        elif self.features_type == 'logp':
+            return PlaceHolder(
+                X=X_t.new_zeros((B, L, 0)),
+                E=None,
+                y=y_t  # logP as global condition (B, 1)
+            )
+
+        elif self.features_type == 'length+logp':
+            return PlaceHolder(
+                X=X_t.new_zeros((B, L, 0)),
+                E=None,
+                y=torch.cat([length_ratio, y_t], dim=-1)  # (B, 2)
+            )
+
+        elif self.features_type == 'none':
+            return PlaceHolder(
+                X=X_t.new_zeros((B, L, 0)),
+                E=None,
+                y=None
+            )
+
+        else:
+            raise ValueError(f"Unsupported extra feature type: {self.features_type}")

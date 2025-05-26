@@ -7,19 +7,11 @@ import os
 
 import pytorch_lightning as pl
 
-'''
-from models.transformer_model import GraphTransformer
-from diffusion.noise_schedule import DiscreteUniformTransition, PredefinedNoiseScheduleDiscrete,\
-    MarginalUniformTransition
-from src.diffusion import diffusion_utils
-from metrics.train_metrics import TrainLossDiscrete
-from metrics.abstract_metrics import SumExceptBatchMetric, SumExceptBatchKL, NLL
-from src import utils
-'''
-from SmD3PM_utils import PlaceHolder # utils
+from SmD3PM_utils import PlaceHolder, setup_wandb # utils
 from SmD3PM_utils import pad_distributions, sum_except_batch, sample_discrete_features, posterior_distribution, reverse_tensor, compute_batched_over0_posterior_distribution # diffusion_utils
 from SmD3PM_utils import AbsorbingStateTransition, PredefinedNoiseScheduleDiscrete # noise_schedule
 from SmD3PM_utils import SumExceptBatchMetric, SumExceptBatchKL, NLL # abstract_metrics
+from SmD3PM_utils import TrainLossDiscrete # train_metrics
 
 class X0Model(nn.Module):
     def __init__(self, n_channel: int, N: int = 16) -> None:
@@ -46,13 +38,13 @@ class SmD3PM(nn.Module):
 
         self.tokenizer = tokenizer
 
-        self.train_loss = TrainLossDiscrete() # To do: make loss function
+        self.train_loss = TrainLossDiscrete(self.cfg.model.lambda_train) # To do: make loss function
         self.val_nll = NLL()
         self.val_X_kl = SumExceptBatchKL()
         self.val_X_logp = SumExceptBatchMetric()
 
         self.test_nll = NLL()
-        self.test_X_kl = SumExceptBatchKL()
+        self.test_X_kl = SumExceptBatchKL() # val와 계산 방법은 같지만, 기록하는 공책이 다르다!
         self.test_X_logp = SumExceptBatchMetric()
 
         self.train_metrics = train_metrics
@@ -96,24 +88,250 @@ class SmD3PM(nn.Module):
         self.best_val_nll = 1e8
         self.val_counter = 0
 
+    def forward(self, noisy_data, extra_data, pad_mask):
+        X = torch.cat((noisy_data['X_t'], extra_data.X), dim=-1).float() # (bs, L, vocab_size + extra_features)
+        y = torch.hstack((noisy_data['y_t'], extra_data.y))
+        return self.x0_model(X, y)
+    
     # train.py ---------------------------
-    def training_step(self, data, batch_idx):
+    def training_step(self, batch, batch_idx): # To do: i 가 batch index인지 확인하고 맞다면 batch_idx로 바꾸기
         # data.x: (batch_size, seq_len) -> tokenized input sequences
         # data.pad_mask: (batch_size, seq_len) -> True if real token, False if pad
-        input_seq = data.x # To do: check where is data
-        pad_mask = data.pad_mask
+        input_seq = batch.x # To do: check where is data
+        pad_mask = batch.pad_mask
 
         # 1. Apply noise to input data
-        noisy_seq = self.apply_noise(input_seq, pad_mask, data.y)
+        noisy_seq = self.apply_noise(input_seq, pad_mask, batch.y)
 
         # 2. Compute additional features if needed (ex. t, time-step embedding)
+        extra_features = self.compute_extra_data(noisy_seq)
 
+        # 3. Forward pass   # 근데 여기서 말하는 forward가 x0가 맞나? 일단 내 forward pass는 x0를 예측하는 건데
+        pred = self.forward(noisy_seq, extra_features, pad_mask)
 
+        # 4. Compute loss # To do:  이 놈의 train_loss는 도대체 어디서 정의하는 건데!!!! # train_metrics는 또 뭔데요? 
+        loss = self.train_loss(
+            masked_pred_seq=pred.seq,  # pred.seq: (batch_size, seq_len, vocab_size)
+            pred_y=pred.y,
+            true_seq=input_seq,
+            true_y=batch.y,
+            pad_mask=pad_mask,
+            log=(batch_idx % self.log_every_steps == 0)
+        )
 
+        # 5. log training metrics # To do: Check # Optioinal
+        self.train_metrics(
+            masked_pred_seq=pred.seq,
+            true_seq=input_seq,
+            pad_mask=pad_mask,
+            log=(batch_idx % self.log_every_steps == 0)
+        )
 
+        return {'loss': loss}
+    
+    def configure_optimizers(self):
+        return torch.optim.AdamW(self.parameters(), lr=self.cfg.train.lr, amsgrad=True, weight_decay=self.cfg.train.weight_decay)
+        # To do: Check
 
+    def on_fit_start(self) -> None:
+        self.train_iterations = len(self.trainer.datamodule.train_dataloader()) # 훈련 데이터 배치 수 계산해서 저장
+        self.print("Size of the input features", self.Xdim, self.ydim)
+        if self.local_rank == 0: # 메인 프로세스만 실행 # 외부 로깅 툴은 여러 프로세스에서 동시에 호출하면 오류가 생기므로, 한 프로세스만 실행
+            setup_wandb(self.cfg)
 
-    # training model ----------------------
+    def on_train_epoch_start(self) -> None:
+        self.print("Starting train epoch...") # self.print : main process에서만 실행 -> log가 꼬이거나 중복되지 않도록
+        self.start_epoch_time = time.time() 
+        self.train_loss.reset() # train_loss 초기화
+        self.train_metrics.reset() # train_metrics 초기화 # 정확도, F1-score, recall, precision 등 평가 지표(metric)을 관리하는 클래스
+
+    def on_train_epoch_end(self) -> None:
+        to_log = self.train_loss.log_epoch_metrics() # epoch 동안 수집한 손실 값들(x_CE, y_CE 등)을 정리해서 반환
+        self.print(f"Epoch {self.current_epoch}: X_CE: {to_log['train_epoch/x_CE'] :.3f}"
+                      f" y_CE: {to_log['train_epoch/y_CE'] :.3f}"
+                      f" -- {time.time() - self.start_epoch_time:.1f}s ")
+        epoch_at_metrics = self.train_metrics.log_epoch_metrics()
+        self.print(f"Epoch {self.current_epoch}: {epoch_at_metrics}")
+        if torch.cuda.is_available():
+            print(torch.cuda.memory_summary()) # 메모리 사용 현황 출력
+        else:
+            print("CUDA is not available. Skipping memory summary.")
+
+    def on_validation_epoch_start(self) -> None:
+        self.val_nll.reset()
+        self.val_X_kl.reset()
+        self.val_X_logp.reset()
+        self.sampling_metrics.reset()
+
+    def validation_step(self, batch, batch_idx):
+        input_seq = batch.x 
+        pad_mask = batch.pad_mask
+
+        noisy_seq = self.apply_noise(input_seq, pad_mask, batch.y)
+        extra_features = self.compute_extra_data(noisy_seq)
+        pred = self.forward(noisy_seq, extra_features, pad_mask)
+        nll = self.compute_val_loss(pred, noisy_seq, input_seq, batch.y,  pad_mask, test=False) # To do: Check # 아니 update를 시켜줘야 하는 거 아냐? 이건 validation이구나... 그럼 지금까지 한 게 train loss가 아니었구나...
+        
+        return {'loss': nll}
+
+    def on_validation_epoch_end(self) -> None:
+        metrics = [self.val_nll.compute(), self.val_X_kl.compute() * self.T, self.val_X_logp.compute() * self.T] # To do: Check # log p는 뭐야? # diffusion 수만큼 누적되는 것 반영
+        if wandb.run:
+            wandb.log({
+                "val/epoch_nll": metrics[0],
+                "val/X_kl": metrics[1],
+                "val/X_logp": metrics[2]
+            }, commit=False) # 로그 그룹화 가능하게 commit=False로 설정
+        self.print(f"Epoch {self.current_epoch}: Val NLL {metrics[0]: .2f} -- Val KL {metrics[1]: .2f} -- Val log p {metrics[2]: .2f} -- {time.time() - self.start_epoch_time:.1f}s ")
+
+        # Lightning 내부 로거에 NLL 등록 (Checkpoint callback이 모니터할 수 있게)
+        val_nll = metrics[0]
+        self.log("val/epoch_NLL", val_nll, sync_dist=True)
+
+        if val_nll < self.best_val_nll:
+            self.best_val_nll = val_nll
+        self.print('Val loss: %.4f \t Best val loss:  %.4f\n' % (val_nll, self.best_val_nll))
+        
+        self.val_counter += 1
+        if self.val_counter % self.cfg.general.early_stopping == 0: # 일정 주기마다 샘플 생성
+            start = time.time()
+            samples_left_to_generate = self.cfg.general.samples_to_generate
+            samples_left_to_save = self.cfg.general.samples_to_save
+            chains_left_to_save = self.cfg.general.chains_to_save
+
+            samples = []
+
+            id = 0
+            while samples_left_to_generate > 0:
+                batch_size = 2 * self.cfg.train.batch_size
+                to_generate = min(samples_left_to_generate, batch_size)
+                to_save = min(samples_left_to_save, batch_size) # To do : Check # Batch size랑 비교를 하는 게 맞나? # 나머지랑 같은 거면 그냥 하나만 써도 되잖아.
+                chains_save = min(chains_left_to_save, batch_size) # To do : Check # Batch size랑 비교를 하는 게 맞나?
+                samples.extend(self.sample_batch(batch_id=id, batch_size=to_generate, num_nodes=None, # sample_batch()로 생성된 샘플 누적
+                                                 save_final=to_save,
+                                                 keep_chain=chains_save,
+                                                 number_chain_steps=self.number_chain_steps))
+                id += to_generate
+
+                samples_left_to_save -= to_save
+                samples_left_to_generate -= to_generate
+                chains_left_to_save -= chains_save
+            
+            self.print("Computing sampling metrics...")
+            self.sampling_metrics.forward(samples, self.name, self.current_epoch, val_counter=-1, test=False,
+                                          local_rank=self.local_rank) # To do: Check # Forward가 왜 여기서 나와? 내가 정의한 forward가 이런 게 아니었던 거 같은데? 그냥 x_0 예측하는 거였던 거 같은데...
+            
+            self.print(f'Done. Sampling took {time.time() - start:.2f} seconds\n')
+            print("Validation epoch end ends...")
+
+    def on_test_epoch_start(self) -> None:
+        self.print("Starting test...")
+        self.test_nll.reset()
+        self.test_X_kl.reset()
+        self.test_X_logp.reset()
+        if self.local_rank == 0:
+            setup_wandb(self.cfg)
+
+    def test_step(self, batch, batch_idx):
+        input_seq = batch.x 
+        pad_mask = batch.pad_mask
+        noisy_seq = self.apply_noise(input_seq, pad_mask, batch.y)
+        extra_features = self.compute_extra_data(noisy_seq)
+        pred = self.forward(noisy_seq, extra_features, pad_mask)
+        nll = self.compute_val_loss(pred, noisy_seq, input_seq, batch.y,  pad_mask, test=True) 
+        return {'loss': nll}
+    
+    def on_test_epoch_end(self) -> None:
+        """ Measure likelihood on a test set and compute stability metrics. """
+        metrics = [self.test_nll.compute(), self.test_X_kl.compute(), self.test_X_logp.compute()]
+        if wandb.run:
+            wandb.log({"test/epoch_nll": metrics[0],
+                       "test/X_kl": metrics[1],
+                       "test/X_logp": metrics[2]}, commit=False)
+        self.print(f"Epoch {self.current_epoch}: Test NLL {metrics[0]: .2f} -- Test KL {metrics[1]: .2f} -- Test log p {metrics[2]: .2f} -- {time.time() - self.start_epoch_time:.1f}s ")
+        
+        test_nll = metrics[0]
+        if wandb.run:
+            wandb.log({"test/epoch_NLL": test_nll}, commit=False)
+
+        self.print(f'Test loss: {test_nll:.4f}\n') # 그냥 이것만 소수점 4자리로 출력하고 싶었나봐...
+
+        samples_left_to_generate = self.cfg.general.final_model_samples_to_generate
+        samples_left_to_save = self.cfg.general.final_model_samples_to_save
+        chains_left_to_save = self.cfg.general.final_model_chains_to_save
+
+        samples = []
+        id = 0
+        while samples_left_to_generate > 0:
+            self.print(f'Samples left to generate: {samples_left_to_generate}/'
+                       f'{self.cfg.general.final_model_samples_to_generate}', end='', flush=True)
+            batch_size = 2 * self.cfg.train.batch_size
+            to_generate = min(samples_left_to_generate, batch_size) # 각각 하고 싶은 수량이 다를 수 있으니까~~
+            to_save = min(samples_left_to_save, batch_size)
+            chains_save = min(chains_left_to_save, batch_size)
+            samples.extend(self.sample_batch(id, to_generate, num_nodes=None, save_final=to_save,
+                                             keep_chain=chains_save, number_chain_steps=self.number_chain_steps))
+            id += to_generate
+            samples_left_to_save -= to_save
+            samples_left_to_generate -= to_generate
+            chains_left_to_save -= chains_save
+        # Saving
+        self.print("Saving the generated graphs")
+        filename = f'generated_samples1.txt' # argparse로 바꾸던지해서 좀 더 유연해지도록
+        for i in range(2, 30):
+            if os.path.exists(filename):
+                filename = f'generated_samples{i}.txt' # 오~ 이렇게 늘려가는 방법 괜찮은데~
+            else:
+                break
+        with open(filename, 'w') as f:
+            for seq in samples:  # 각 seq는 tensor 또는 str로 가정
+                if isinstance(seq, torch.Tensor):
+                    seq = seq.tolist()  # 예: [12, 5, 3, 7, 9]
+                    f.write(" ".join(map(str, seq)) + "\n")
+                elif isinstance(seq, str): # To do: check # 이런 경우에 대한 고려가 굳이 필요한지 확인 ㄱ
+                    f.write(seq + "\n")  # 예: 'CC(C)O'
+        self.print("Generated graphs Saved. Computing sampling metrics...")
+        self.sampling_metrics(samples, self.name, self.current_epoch, self.val_counter, test=True, local_rank=self.local_rank)
+        self.print("Done testing.")
+
+    # data processing ----------------------
+    def apply_noise(self, X, pad_mask, y):
+        """ Sample noise and apply it to the data. """
+        # Sample a timestep t.
+        # When evaluating, the loss for t=0 is computed separately \therefore lowest_t = 1
+        lowest_t = 0 if self.training else 1
+        t_int = torch.randint(low=lowest_t, high=self.T + 1, size=(X.size(0), 1), device=X.device).float() # (bs, 1) # t ~ Uniform(0, T) for each sample in batch
+        s_int = t_int - 1 # (bs, 1) # s = t - 1
+
+        t_normalized = t_int / self.T # (bs, 1) # t / T
+        s_normalized = s_int / self.T
+
+        # beta_t and alpha_s_bar are used for denoising/loss computation
+        beta_t = self.noise_schedule.get_beta(t_normalized = t_normalized) # (bs, 1) # beta_t
+        alpha_s_bar = self.noise_schedule.get_alpha_bar(t_normalized = s_normalized) # (bs, 1) # alpha_s_bar
+        alpha_t_bar = self.noise_schedule.get_alpha_bar(t_normalized = t_normalized) # (bs, 1) # alpha_t_bar
+
+        Qtb = self.transition_model.get_Qt_bar(alpha_t_bar, device=self.device)
+        assert (abs(Qtb.X.sum(dim=2) - 1.) < 1e-4).all(), Qtb.X.sum(dim=2) - 1 # row의 총 합이 1인가? (== normalize가 잘 되어 있는가?)
+
+        # Compute tranisition probabilities
+        probX = X @ Qtb.X # (bs, L, vocab) # X_noise
+
+        # Sample noisy sequence
+        sampled_t = sample_discrete_features(probX=probX, pad_mask=pad_mask, device=self.device) # (bs, L) # sampled t for each token
+
+        # One-hot encoding
+        X_t = F.one_hot(sampled_t, num_classes=self.vocab_size) # num classes
+        assert (X.shape == X_t.shape)
+
+        z_t = PlaceHolder(X=X_t, y=y).type_as(X_t).pad(pad_mask=pad_mask) # pad mask로 수정
+
+        noisy_data = {'t_int': t_int, 't': t_normalized, 'beta_t': beta_t, 'alpha_s_bar': alpha_s_bar,
+                      'alpha_t_bar': alpha_t_bar, 'X_t': z_t.X, 'y_t': z_t.y, 'pad_mask': pad_mask}
+
+        return noisy_data
+
+    # validation loss ----------------------
     def kl_prior(self, X, pad_mask): # L_T
         """
         Computes the KL between q(z1 | x) and the prior p(z1) = Normal(0, 1).
@@ -206,44 +424,8 @@ class SmD3PM(nn.Module):
         probX0[~pad_mask] = torch.ones(self.Xdim_output).type_as(probX0)
 
         return PlaceHolder(X=probX0, y=proby0) # -log p_θ(x₀) 계산을 위한 확률 분포 출력
-        
-    def apply_noise(self, X, y, pad_mask):
-        """ Sample noise and apply it to the data. """
-        # Sample a timestep t.
-        # When evaluating, the loss for t=0 is computed separately \therefore lowest_t = 1
-        lowest_t = 0 if self.training else 1
-        t_int = torch.randint(low=lowest_t, high=self.T + 1, size=(X.size(0), 1), device=X.device).float() # (bs, 1) # t ~ Uniform(0, T) for each sample in batch
-        s_int = t_int - 1 # (bs, 1) # s = t - 1
 
-        t_normalized = t_int / self.T # (bs, 1) # t / T
-        s_normalized = s_int / self.T
-
-        # beta_t and alpha_s_bar are used for denoising/loss computation
-        beta_t = self.noise_schedule.get_beta(t_normalized = t_normalized) # (bs, 1) # beta_t
-        alpha_s_bar = self.noise_schedule.get_alpha_bar(t_normalized = s_normalized) # (bs, 1) # alpha_s_bar
-        alpha_t_bar = self.noise_schedule.get_alpha_bar(t_normalized = t_normalized) # (bs, 1) # alpha_t_bar
-
-        Qtb = self.transition_model.get_Qt_bar(alpha_t_bar, device=self.device)
-        assert (abs(Qtb.X.sum(dim=2) - 1.) < 1e-4).all(), Qtb.X.sum(dim=2) - 1 # row의 총 합이 1인가? (== normalize가 잘 되어 있는가?)
-
-        # Compute tranisition probabilities
-        probX = X @ Qtb.X # (bs, L, vocab) # X_noise
-
-        # Sample noisy sequence
-        sampled_t = sample_discrete_features(probX=probX, pad_mask=pad_mask, device=self.device) # (bs, L) # sampled t for each token
-
-        # One-hot encoding
-        X_t = F.one_hot(sampled_t, num_classes=self.vocab_size) # num classes
-        assert (X.shape == X_t.shape)
-
-        z_t = PlaceHolder(X=X_t, y=y).type_as(X_t).pad(pad_mask=pad_mask) # pad mask로 수정
-
-        noisy_data = {'t_int': t_int, 't': t_normalized, 'beta_t': beta_t, 'alpha_s_bar': alpha_s_bar,
-                      'alpha_t_bar': alpha_t_bar, 'X_t': z_t.X, 'y_t': z_t.y, 'pad_mask': pad_mask}
-
-        return noisy_data
-
-    def compute_val_loss(self, pred, noisy_data, X, y, pad_mask, test=False):
+    def compute_val_loss(self, pred, noisy_data, X, y, pad_mask, test=False): # To do: check # 그럼 training loss는 어디에 있는 거야?
         """
         Computes sequence-based variational lower bound (VLB) loss.
 
@@ -302,12 +484,7 @@ class SmD3PM(nn.Module):
 
         return nll
 
-    def forward(self, noisy_data, extra_data, pad_mask):
-        X = torch.cat((noisy_data['X_t'], extra_data.X), dim=-1).float() # (bs, L, vocab_size + extra_features)
-        y = torch.hstack((noisy_data['y_t'], extra_data.y))
-        return self.x0_model(X, y)
-
-    # sampling ----------------------------
+    # sampling model ----------------------------
     @torch.no_grad()
     def sample_batch(self, batch_id: int, batch_size: int, keep_chain: int, number_chain_steps: int, save_final: int, seq_lens=None, max_len=None):
         """
