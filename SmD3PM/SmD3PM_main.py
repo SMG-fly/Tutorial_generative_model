@@ -1,14 +1,31 @@
+import argparse
 import os
-import pathlib
 import hydra
+from hydra import initialize, compose
 
 import torch
+from torch.serialization import safe_globals
 from omegaconf import DictConfig
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint # To do: check # ModelCheckpoint는 모델 저장을 위한 콜백, EMA는 Exponential Moving Average를 적용하기 위한 콜백
 
 from SmD3PM_model import SmD3PM
 from SmD3PM_utils import update_config_with_new_keys, create_folders # utils
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Train DiGress on SMILES dataset(Sequence).")
+    parser.add_argument('--config', type=str, default='config/SmD3PM_config.yaml')
+    parser.add_argument('overrides', nargs=argparse.REMAINDER)
+    return parser.parse_args()
+
+def load_config_from_args() -> DictConfig:
+    args = parse_arguments()
+    config_path, config_file = os.path.split(args.config)
+    config_name = os.path.splitext(config_file)[0]
+
+    with initialize(version_base="1.3", config_path=config_path):
+        cfg = compose(config_name=config_name, overrides=args.overrides)
+    return cfg
 
 def get_resume(cfg, model_kwargs):
     """ Resumes a run. It loads previous config without allowing to update keys (used for testing). """
@@ -32,8 +49,7 @@ def get_resume_adaptive(cfg, model_kwargs): # cfg: 현재 실행된 Hydra 설정
 
     # Fetch path to this file to get base path 
     current_path = os.path.dirname(os.path.realpath(__file__)) # 현재 py 파일의 경로를 가져옴 
-    root_dir = current_path.split('output')[0] # To do: output 파일이 어디에 있냐에 따라 이 부분 수정 필요
-    resume_path = os.path.join(root_dir, cfg.general.resume) # resume_path는 절대 경로로 바뀌게 된다. # cfg.general.resume는 상대 경로로 저장되어 있음
+    resume_path = os.path.join(current_path, cfg.general.resume) # resume_path는 절대 경로로 바뀌게 된다. # cfg.general.resume는 상대 경로로 저장되어 있음
 
     model = SmD3PM.load_from_checkpoint(resume_path, **model_kwargs) # 체크포인트로부터 모델 파라미터와 함께 config도 불러옴
     new_cfg = model.cfg # 훈련 당시 저장된 설정값
@@ -54,9 +70,16 @@ from SmD3PM_dataset import SequenceDataModule, SequenceDatasetInfos   # 수정�
 from SmD3PM_utils import TrainSequenceMetrics, SamplingSequenceMetrics # spectre_utils
 from SmD3PM_utils import ExtraFeatures, DummyExtraFeatures # extra_features
 
-
-@hydra.main(version_base='1.3', config_path='SmD3PM/config', config_name='SmD3PM_config') # To do: Config path 적절히 general한 이름으로 설정, 폴더 미리 만들어두는 것도 괜찮을듯. 앞을 default로 두고, argparse로 custum까지 할 수 있으면 금상첨화
 def main(cfg: DictConfig): 
+
+    ##### For Debugging #####
+    if cfg.general.debug:  # 또는 args.debug
+        import debugpy
+        debugpy.listen(("0.0.0.0", 5678))
+        print("Waiting for debugger attach...")
+        debugpy.wait_for_client()
+        print("Debugger attached.")
+    #########################
         
     datamodule = SequenceDataModule(cfg) # load dataset # train/val/test DataLoader를 생성하는 PyTorch Lightning 모듈
     dataset_infos = SequenceDatasetInfos(datamodule, cfg) # datset 정보 구성 # 토크나이저, vocab size, padding 정보 등 → 모델 입력/출력 차원 계산, 마스킹, 조건 생성 등에 사용
@@ -75,8 +98,8 @@ def main(cfg: DictConfig):
         extra_features = DummyExtraFeatures()
         domain_features = DummyExtraFeatures() # Domain features 빼도 되는지 확인
 
-    # Input/Output dimension 계산
-    dataset_infos.compute_input_output_dims(datamodule=datamodule, extra_features=extra_features, domain_features=domain_features)
+    # Input/Output dimension 계산 # input_dims, output_dims update # 혹시 extra_features가 추가했을지 모르니까!
+    dataset_infos.compute_input_output_dims(extra_features=extra_features, domain_features=domain_features)
 
     model_kwargs = {'dataset_infos': dataset_infos, 'train_metrics': train_metrics, 'sampling_metrics': sampling_metrics, 
                     'extra_features': extra_features, 'domain_features': domain_features}
@@ -100,23 +123,19 @@ def main(cfg: DictConfig):
     # To do: check # 왜 model save부터 해?
     callbacks = [] # 이건 왜 나온 거야? # To do: check
     if cfg.train.save_model:
-        checkpoint_callback = ModelCheckpoint(difpath=f"checkpoints/{cfg.general.name}",
+        checkpoint_callback = ModelCheckpoint(dirpath=f"{cfg.save.checkpoint_path}/{cfg.general.name}",
                                               filename='{epoch}',
-                                              monitor='val/epoch_NLL', # To do: nll, NLL 둘 다 있는 거 거슬려서 그냥 하나만 살릴까 싶음...
+                                              monitor='val/epoch_NLL', # logger에 기록된 값 중 val/epoch_NLL을 모니터링
                                               save_top_k=5,
                                               mode='min',
                                               every_n_epochs=1) # Every_n_epochs: 몇 epoch마다 저장할지
-        last_ckpt_save = ModelCheckpoint(dirpath=f"checkpoints/{cfg.general.name}",
+        last_ckpt_save = ModelCheckpoint(dirpath=f"{cfg.save.checkpoint_path}/{cfg.general.name}",
                                          filename='last', every_n_epochs=1)
         callbacks.append(last_ckpt_save)
         callbacks.append(checkpoint_callback) # To do: check # callback list에 추가하면 무슨 일이 생기지?
 
-    name = cfg.general.name
-    if name == 'debug':
+    if cfg.general.debug:
         print("[WARNING]: Run is called 'debug' -- it will run with fast_dev_run. ")
-        # 뭐야 그런 걸 어디서 설정했길래 이런 경고문을 뱉어? 그리고 여기에다 내가 맨날 디버깅 코드 넣어두는 거 넣으면 되겠다!
-        # fast_dev_run은 hydra에서 제공하는 기능
-        # 확실한 건 hydra를 공부해야...
 
     # 드디어 trainer ###
     use_gpu = cfg.general.gpus > 0 and torch.cuda.is_available()
@@ -127,22 +146,28 @@ def main(cfg: DictConfig):
                     devices=cfg.general.gpus if use_gpu else 1,
                     max_epochs=cfg.train.n_epochs,
                     check_val_every_n_epoch=cfg.general.check_val_every_n_epochs,
-                    fast_dev_run=cfg.general.name == 'debug',
-                    enable_progress_bar=False,
+                    fast_dev_run=cfg.general.debug,
+                    enable_progress_bar=False, # True로 해봤지만... 여전히 아무것도 돌아가지 않는다...
                     callbacks=callbacks, # callback들이 아래 작업을 자동으로 수행: # 1) 모델 저장, 2) 학습 중간에 EMA 적용, etc.
-                    log_every_n_steps=50 if name != 'debug' else 1,
-                    logger = []) # To do: Trainer 어떻게 쓰는 건지 알아보기
-    
+                    log_every_n_steps=cfg.trainer.log_every_steps,
+                    logger = None) # To do: Trainer 어떻게 쓰는 건지 알아보기 # wandblogger를 연동하는 것 고려해보기
 
     # test_only == False이면 학습 후 best 모델로 test
     if not cfg.general.test_only: 
-        trainer.fit(model, datamodule=datamodule, ckpt_path=cfg.general.resume) # 학습을 하고 test # To do: check # datamodule은 뭐지? # datamodule은 pytorch lightning에서 데이터셋을 관리하는 모듈임
-        if cfg.general.name not in ['debug', 'test']: # To do: 이게 무슨 조건이고 아래 코드는 무슨 코드지?
-            trainer.test(model, datamodule=datamodule, ckpt_path='best')
+        trainer.fit(model, datamodule=datamodule, ckpt_path=cfg.general.resume) # Trainer.fit()은 모델을 학습시키는 함수 # datamodule: train/val/test DataLoader를 생성하는 PyTorch Lightning 모듈
+        
+        if not cfg.general.debug: # To do: 이게 무슨 조건이고 아래 코드는 무슨 코드지?
+            best_ckpt_path = checkpoint_callback.best_model_path
+            if not best_ckpt_path or not os.path.exists(best_ckpt_path): # best checkpoint가 없다면 last.ckpt로 fallback
+                print("[INFO] No best checkpoint found. Using last.ckpt as fallback.")
+                best_ckpt_path = f"{cfg.save.checkpoint_path}/{cfg.general.name}/last.ckpt"
+            
+            trainer.test(model, datamodule=datamodule, ckpt_path=best_ckpt_path)
 
     else: # test_only인 경우 # 학습(trainer.fit) 없이 바로 test를 진행
         # Start by evaluating test_only_path
         trainer.test(model, datamodule=datamodule, ckpt_path=cfg.general.test_only)
 
 if __name__ == "__main__":
-    main()
+    cfg = load_config_from_args()
+    main(cfg)

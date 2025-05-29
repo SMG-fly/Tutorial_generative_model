@@ -5,6 +5,9 @@ from torchmetrics import Metric, MeanSquaredError
 import os
 import wandb
 import omegaconf
+
+from rdkit import Chem
+
 import torch.nn as nn
 import torch.nn.functional as F
 from torchmetrics import Metric
@@ -13,12 +16,13 @@ from torchmetrics import Metric
 class PlaceHolder: # To do: Check And Modify argmax
     def __init__(self, X, y=None):
         self.X = X
-        self.y = y
+        self.y = y 
 
     def type_as(self, x: torch.Tensor):
         """ Changes the device and dtype of X, E, y. """
         self.X = self.X.type_as(x)
-        self.y = self.y.type_as(x)
+        if self.y is not None: # y가 None이 아니고, 차원이 0보다 클 때만
+            self.y = self.y.type_as(x)
         return self
 
     def pad(self, pad_mask, convert_to_idx=False): # padding 부분을 학습에서 무시하게 해주는 역할
@@ -29,26 +33,34 @@ class PlaceHolder: # To do: Check And Modify argmax
             # To do: F.cross_entropy(input, target, ignore_index=-1) 로 -1인 부분은 무시하고 loss 계산
 
             if self.y is not None:
-                if self.y.dim() == 3: # (B, L, d)
+                if self.y.dim() == 3:  # (B, L, dy)
                     self.y[pad_mask == 0] = 0
-                else:
-                    pass
+                elif self.y.dim() == 2:  # (B, dy)
+                    pass  # global condition; no masking needed
 
         else: # softmax 상태에서 마스킹
-            self.X = self.X * pad_mask.unsqueeze(-1) 
+            self.X = self.X * pad_mask.unsqueeze(-1).type_as(self.X)
             # self.S.shape = (B, L, V) ← 각 위치에서 V개의 클래스 확률을 가짐
             # # seq_mask.shape = (B, L) ← 1은 유효한 위치, 0은 padding
             # soft 분포인 상태에서 padding 위치는 0으로 날리는 것
 
             if self.y is not None:
-                if self.y.dim() ==3: # (B, L, V)
-                    self.y = self.y * pad_mask.unsqueeze(-1) 
+                if self.y.dim() == 3:  # (B, L, dy)
+                    self.y = self.y * pad_mask.unsqueeze(-1).type_as(self.y)
+                elif self.y.dim() == 2:  # (B, dy)
+                    pass  # not sequence-dependent, don't mask
+        return self
+
+    def to(self, device):
+        self.X = self.X.to(device)
+        if self.y is not None:
+            self.y = self.y.to(device)
         return self
 
 def setup_wandb(cfg):
     config_dict = omegaconf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True) # .yaml 파일을 python dict로 변환
     kwargs = {'name': cfg.general.name, 'project': f'graph_ddm_{cfg.dataset.name}', 'config': config_dict, # wandb.init()에 전달할 설정 값
-              'settings': wandb.Settings(_disable_stats=True), 'reinit': True, 'mode': cfg.general.wandb}
+              'settings': wandb.Settings(_disable_stats=True), 'reinit': True, 'mode': cfg.general.wandb} # wandb mode 조건부 제어 가능 # 유연성 제공
     wandb.init(**kwargs)
     wandb.save('*.txt') # To do: Check whethere this is necessary # maybe memory waste
 
@@ -64,18 +76,65 @@ def update_config_with_new_keys(cfg, saved_cfg):
     return cfg # 업데이트된 cfg 반환
 
 def create_folders(cfg): # 필요한 folder를 미리 만들어두는 함수 # To do: customize
-    os.makedirs(os.path.join('checkpoints', cfg.general.name), exist_ok=True)
+    os.makedirs(os.path.join(cfg.save.checkpoint_path, cfg.general.name), exist_ok=True)
 
     # 필요한 경우만
     if cfg.general.save_chain_steps:
-        os.makedirs(os.path.join('chains', cfg.general.name), exist_ok=True)
+        os.makedirs(os.path.join(cfg.save.chain_step_result_path, cfg.general.name), exist_ok=True)
+
+def move_to_device(batch, device):
+    if isinstance(batch, dict):
+        return {k: move_to_device(v, device) for k, v in batch.items()}
+    elif isinstance(batch, list):
+        return [move_to_device(v, device) for v in batch]
+    elif isinstance(batch, torch.Tensor):
+        return batch.to(device)
+    elif hasattr(batch, 'to'):
+        return batch.to(device)
+    else:
+        return batch
+    
+def save_generated_sequences(samples, cfg, tokenizer):
+    """
+    Save generated sequences to a decoded text file.
+    
+    Args:
+        samples (List[Tensor] or List[str]): generated sequences
+        cfg: configuration object with save path
+        tokenizer: object with decode(List[int]) -> str method
+    """
+    print("Saving the generated sequences...\n")
+
+    save_dir = cfg.save.generated_sequence_path
+    os.makedirs(save_dir, exist_ok=True)
+
+    base_filename = os.path.join(save_dir, 'generated_samples')
+    for i in range(1, 100):  # 최대 100개까지 허용
+        filename = f"{base_filename}{i}.txt"
+        if not os.path.exists(filename):
+            break
+    
+    with open(filename, 'w') as f:
+        for seq in samples:
+            if isinstance(seq, torch.Tensor):
+                seq = seq.tolist()
+                
+            if isinstance(seq, list):
+                decoded = tokenizer.decode(seq)  # 리스트 → 문자열
+            elif isinstance(seq, str):
+                decoded = seq
+            else:
+                raise TypeError(f"Unexpected type for sequence: {type(seq)}")
+            f.write(decoded + "\n")
+
+    print(f"Generated sequences saved to {filename}. Computing sampling metrics...")
 
 # Diffusion Utils ----------------------
 
 def absorbing_beta_schedule_discrete(timesteps: int):
     """ Absorbing-state beta schedule: beta_t = 1 / (T - t + 1) """
     betas = np.array([1 / (timesteps - t + 1) for t in range(timesteps)], dtype=np.float32)
-    return betas
+    return betas # 그냥 betas부터 GPU에 넣어버릴까? # 근데 굳이 또 수정하긴 귀찮.
 
 def pad_distributions(true_X, pred_X, pad_mask, pad_token_idx):
     """
@@ -128,10 +187,10 @@ def sample_discrete_features(probX, pad_mask, pad_idx = None):
     batch, length, vocab_size = probX.shape
 
     # 1. Masking 처리
-    if pad_idx: # padding 위치는 전부 pad만 뽑도록
+    if pad_idx is not None: # padding 위치는 전부 pad만 뽑도록
         probX[~pad_mask] = 0
         probX[~pad_mask, pad_idx] = 1
-    else: # padding 위치는 uniform distribution으로 sampling
+    else: # pad_idx가 없더라도 uniform distribution으로 sampling
         probX[~pad_mask] = 1.0 / vocab_size
 
     # 2. Flatten 후 multinomial sampling
@@ -141,11 +200,7 @@ def sample_discrete_features(probX, pad_mask, pad_idx = None):
     X_t = probX_flat.multinomial(1) # 각 위치에서 token 하나만 뽑고 싶으니까 1 # (batch * length, 1)
     X_t = X_t.reshape(batch, length) 
 
-    # 4. global feature y는 사용하지 않으므로 빈 텐서로 대체 
-    # placeholder 자리 채우기용
-    y_dummy = torch.zeros(batch, 0).type_as(X_t)
-
-    return PlaceHolder(X=X_t, y=y_dummy)
+    return PlaceHolder(X=X_t, y=torch.zeros(batch, 0).type_as(X_t))
 
 def compute_posterior_distribution(M, M_t, Qt_M, Qsb_M, Qtb_M):
     ''' M: X or E
@@ -170,6 +225,7 @@ def compute_posterior_distribution(M, M_t, Qt_M, Qsb_M, Qtb_M):
 
 def posterior_distribution(X, y, X_t, y_t, Qt, Qsb, Qtb):
     prob_X = compute_posterior_distribution(M=X, M_t=X_t, Qt_M=Qt, Qsb_M=Qsb, Qtb_M=Qtb) # Debugging할 때 Qt가 들어가는 게 맞는지 확인
+    # y는 안 해도 되는 거야?
     
     return PlaceHolder(X=prob_X, y=y_t)
 
@@ -251,6 +307,8 @@ class AbsorbingStateTransition:
         self.u = torch.zeros(1, self.num_classes, self.num_classes)
         self.u[:, :, self.abs_state] = 1 # Absorbing state만 1
 
+        print(f"[DEBUG] self.u.shape: {self.u.shape}")
+
     def get_Qt(self, beta_t):
         """ 
         Returns transition matrix 
@@ -258,9 +316,10 @@ class AbsorbingStateTransition:
         beta_t: (B,) 확률 (t 시점에서 noise를 얼마나 섞을지) # B: batch size
         return: q_t: (B, C, C) transition matrix at time t
         """
+        device = beta_t.device
         beta_t = beta_t.unsqueeze(1) # (B, 1)
-        eye = torch.eye(self.num_classes).unsqueeze(0) # (1, C, C)
-        q_t = beta_t * self.u + (1 - beta_t) * eye # (B, C, C)
+        eye = torch.eye(self.num_classes, device=device).unsqueeze(0) # (1, C, C)
+        q_t = beta_t * self.u.to(device) + (1 - beta_t) * eye # (B, C, C)
         return q_t
 
     def get_Qt_bar(self, alpha_bar_t): # 논문엔 이렇게 구한다는 말 없었던 거 같은데... 어쨌든 그 논문 코드니까 ㅇㅋ
@@ -268,10 +327,10 @@ class AbsorbingStateTransition:
         alpha_bar_t: (B,) 누적 alpha
         return: (B, C, C) cumulative transition matrix
         """
-
-        alpha_bar_t = alpha_bar_t.unsqueeze(1) # (B, 1)
-        eye = torch.eye(self.num_classes).unsqueeze(0) # (1, C, C)
-        q_t_bar = alpha_bar_t * eye + (1 - alpha_bar_t) * self.u # (B, C, C)
+        device = alpha_bar_t.device
+        alpha_bar_t = alpha_bar_t.unsqueeze(1)               # (B, 1)
+        eye = torch.eye(self.num_classes, device=device).unsqueeze(0)  # (1, C, C)
+        q_t_bar = alpha_bar_t * eye + (1 - alpha_bar_t) * self.u.to(device)  # ensure self.u is on same device
         return q_t_bar
 
 
@@ -327,8 +386,7 @@ class CrossEntropyMetric(Metric):
         preds: (B, L, V) # softmax된 확률 분포
         targets: (B, L, V) # Ground Truth values 
         """
-        target = torch.argmax(target, dim=-1) # target도 분포로 받나봐... 근데 굳이 argmax로 해줘야 하나? 그냥 분포끼리 비교하는 게 더 낫지 않나? # To do: Check
-        output = F.cross_entropy(preds, target, reduction='sum') # (B, L) # 각 위치에서의 cross entropy loss
+        output = F.cross_entropy(preds, targets, reduction='sum') # (B, L) # 각 위치에서의 cross entropy loss
         self.total_ce += output
         self.total_samples += preds.size(0)
 
@@ -336,7 +394,7 @@ class CrossEntropyMetric(Metric):
         return self.total_ce / self.total_samples
 
 # Train metrics ----------------------
-class TrainLossDiscrete(nn.Module):
+class TrainLossDiscrete(nn.Module): # Train Loss
     """ Train with Cross Entropy Loss """
     def __init__(self, lambda_train): # lambda_train: loss_x, loss_y 비율 조정
         super().__init__()
@@ -344,32 +402,31 @@ class TrainLossDiscrete(nn.Module):
         self.y_loss = CrossEntropyMetric()
         self.lambda_train = lambda_train
     
-    def forward(self, masked_pred_X, pred_y, true_X, true_y, log: bool):
+    def forward(self, masked_pred_X, pred_y, true_X, true_y, pad_mask, log: bool):
         """ 
         Compute train metrics
         masked_pred_X : tensor -- (bs, n, dx)
         pred_y : tensor -- (bs, )
-        true_X : tensor -- (bs, n, dx)
+        true_X : tensor -- (bs, n)
         true_y : tensor -- (bs, )
         log : boolean. 
         """
-        # To do: 아래 부분 아직 분석 안 함. 이해하고 아래 reset으로 넘어가기
-        true_X = torch.reshape(true_X, (-1, true_X.size(-1)))  # (bs * n, dx) # 마지막 차원 유지, 앞 차원은 자동 계산 # 시퀀스 전체를 token 단위로 비교하기 위해
-        masked_pred_X = torch.reshape(masked_pred_X, (-1, masked_pred_X.size(-1)))  # (bs * n, dx)
+        # 1. Flatten
+        flat_pred_X = masked_pred_X.view(-1, masked_pred_X.size(-1))  # (bs * seq_len, vocab_size)
+        flat_true_X = true_X.view(-1)  # (bs * seq_len,)
+        flat_mask = pad_mask.view(-1)  # (bs * seq_len,)
+       
+        # 2. Apply mask
+        valid_pred_X = flat_pred_X[flat_mask]
+        valid_true_X = flat_true_X[flat_mask]
 
-        # Remove masked rows
-        mask_X = (true_X != 0.).any(dim=-1) # Vocab 차원에서 0이 아닌 값이 하나라도 있으면 True # pred는 이미 masking 되어 있어서 필요 없음 
-
-        flat_true_X = true_X[mask_X, :]
-        flat_pred_X = masked_pred_X[mask_X, :]
-
-        loss_X = self.X_loss(flat_pred_X, flat_true_X) if true_X.numel() > 0 else 0.0 # numel: tensor 안에 있는 모든 원소의 개수를 반환하는 함수 # 데이터가 없으면 0으로 대체
-        loss_y = self.y_loss(pred_y, true_y) if true_y.numel() > 0 else 0.0 # To do: Check # y는 전처리 필요 없나?
+        loss_X = self.X_loss(valid_pred_X, valid_true_X) if true_X.numel() > 0 else 0.0 # numel: tensor 안에 있는 모든 원소의 개수를 반환하는 함수 # 데이터가 없으면 0으로 대체
+        loss_y = self.y_loss(pred_y, true_y) if true_y is not None else 0.0 # To do: Check # y는 전처리 필요 없나?
 
         if log:
             to_log = {"train_loss/batch_CE": (loss_X + loss_y).detach(),
                       "train_loss/X_CE": self.X_loss.compute() if true_X.numel() > 0 else -1,
-                      "train_loss/y_CE": self.y_loss.compute() if true_y.numel() > 0 else -1}
+                      "train_loss/y_CE": self.y_loss.compute() if true_y is not None else -1}
             if wandb.run:
                 wandb.log(to_log, commit=True)
         return loss_X + self.lambda_train * loss_y 
@@ -391,11 +448,16 @@ class TrainLossDiscrete(nn.Module):
 
 
 # spectre_utils.py --------------------
-class TrainSequenceMetrics: # 아니 근데 이러면 앞에 했던 것들이랑 중복 아닌가? 그리고 이 함수도 확인 후 수정 필요 # To do: check
+class TrainSequenceMetrics: # train loss 는 학습용 및 wandb logging # train metrics는 terminal log 기록용 
     def __init__(self, dataset_infos):
         self.pad_token_idx = dataset_infos.pad_token_idx
         self.vocab_size = dataset_infos.vocab_size
-        self.reset() # 이거 내장 함수야?
+        self.reset() 
+
+    def __call__(self, masked_pred_X, true_X, pad_mask, log=False):
+        self.update(masked_pred_X, true_X, pad_mask)
+        if log and wandb.run:
+            wandb.log(self.compute())
 
     def reset(self):
         self.total_loss = 0.0
@@ -408,22 +470,20 @@ class TrainSequenceMetrics: # 아니 근데 이러면 앞에 했던 것들이랑
         x_0: (B, L)
         pad_mask: (B, L) where 1 = real token, 0 = pad
         """
-        B, L, V = pred_logits.shape
-
-        # flatten
-        logits = pred_logits.view(-1, V)       # (B*L, V)
-        targets = x_0.view(-1)                 # (B*L,)
-        mask = pad_mask.view(-1).bool()        # (B*L,)
+        # flatten # train loss 구할 때랑 같음
+        logits = pred_logits.view(-1, pred_logits.size(-1))       # (B*L, V)
+        targets = x_0.view(-1)                                    # (B*L,)
+        pad_mask = pad_mask.view(-1)                              # (B*L,)       
 
         # loss
-        loss = F.cross_entropy(logits[mask], targets[mask], reduction='sum')
+        loss = F.cross_entropy(logits[pad_mask], targets[pad_mask], reduction='sum')
         self.total_loss += loss.item()
 
         # accuracy
         preds = logits.argmax(dim=-1)          # (B*L,)
-        correct = (preds == targets) & mask
+        correct = (preds == targets) & pad_mask
         self.correct_tokens += correct.sum().item()
-        self.total_tokens += mask.sum().item()
+        self.total_tokens += pad_mask.sum().item()
 
     def compute(self):
         avg_loss = self.total_loss / max(self.total_tokens, 1)
@@ -434,14 +494,56 @@ class TrainSequenceMetrics: # 아니 근데 이러면 앞에 했던 것들이랑
             "train/tokens": self.total_tokens
         }
     
+    def log_epoch_metrics(self):
+        return self.compute()
     
+            
 class SamplingSequenceMetrics: # 이 함수도 확인 후 수정 필요 # To do: check
     def __init__(self, dataset_infos, reference_set=None):
-        self.tokenizer = dataset_infos.inverse_tokenizer  # index → token
+        #self.tokenizer = dataset_infos.inverse_tokenizer  # index → token
+        self.tokenizer = dataset_infos.tokenizer
         self.pad_token_idx = dataset_infos.pad_token_idx
         self.vocab_size = dataset_infos.vocab_size
         self.reference_set = set(reference_set or [])
         self.reset()
+
+    def __call__(self, generated_batch, name=None, epoch=None, val_counter=None, test=False, local_rank=0):
+        """
+        Evaluate sampling quality of generated sequences and log results.
+
+        Args:
+            generated_batch: Tensor (B, L) - batch of sampled sequences
+            name: Optional[str] - experiment name for logging context
+            epoch: Optional[int] - current training epoch
+            val_counter: Optional[int] - validation step counter
+            test: bool - log under 'test/' or 'val/' prefix
+            local_rank: int - only rank 0 logs to wandb
+        """
+        self.reset()
+        self.update(generated_batch)
+        metrics = self.compute()
+
+        if wandb.run and local_rank == 0:
+            prefix = "test/" if test else "val/"
+
+            # 기본 metric 로깅
+            wandb.log({f"{prefix}{k}": v for k, v in metrics.items()}, commit=False)
+
+            # 추가 context 정보 로깅
+            context_log = {}
+            if name is not None:
+                context_log[f"{prefix}run_name"] = name
+            if epoch is not None:
+                context_log[f"{prefix}epoch"] = epoch
+            if val_counter is not None:
+                context_log[f"{prefix}val_counter"] = val_counter
+
+            wandb.log(context_log, commit=False)
+
+            print(f"[SamplingMetrics] {prefix}Results: {metrics}")
+            print(f"[SamplingMetrics] Context: {context_log}")
+
+        return metrics
 
     def reset(self):
         self.decoded = []
@@ -449,25 +551,23 @@ class SamplingSequenceMetrics: # 이 함수도 확인 후 수정 필요 # To do:
         self.total = 0
 
     def decode_sequence(self, idx_seq):
-        # idx_seq: (L,)
-        tokens = [self.tokenizer.get(idx, '') for idx in idx_seq if idx != self.pad_token_idx]
-        return ''.join(tokens)
+        return self.tokenizer.decode(idx_seq)
 
     def update(self, generated_batch):
         """
         generated_batch: Tensor (B, L)
         """
-        for i in range(generated_batch.size(0)):
+        for i in range(len(generated_batch)):
             seq = generated_batch[i].tolist()
             decoded = self.decode_sequence(seq)
             self.total += 1
             self.decoded.append(decoded)
             if self.is_valid(decoded):
-                self.valid_set.add(decoded)
+                self.valid_set.add(decoded) 
 
     def is_valid(self, seq: str):
-        # 예시: SMILES 유효성 검사 → RDKit 또는 길이 기준 등
-        return len(seq) > 0 and all(c.isalnum() or c in "=#()" for c in seq)
+        mol = Chem.MolFromSmiles(seq)
+        return mol is not None
 
     def compute(self):
         total = self.total
@@ -493,11 +593,23 @@ class DummyExtraFeatures:
         """ This class does not compute anything, just returns empty tensors."""
 
     def __call__(self, noisy_data):
-        X = noisy_data['X_t']
-        y = noisy_data['y_t']
-        empty_x = X.new_zeros((*X.shape[:-1], 0)) # 이렇게 empty tensor를 줘도 되는 거야? 기존 x값까지 지워지겠어. extra라서 상관없나?
-        empty_y = y.new_zeros((y.shape[0], 0))
+        X = noisy_data['X_t']  # always expected to be present
+        y = noisy_data.get('y_t', None)  # safe access with fallback
+
+        # Create empty_x: (B, L, 0)
+        empty_x = X.new_zeros((*X.shape[:-1], 0))
+
+        # Create empty_y: (B, 0) if y is None
+        if y is None or (isinstance(y, torch.Tensor) and y.numel() == 0):
+            empty_y = torch.zeros((X.shape[0], 0), device=X.device, dtype=X.dtype)
+        else:
+            empty_y = y.new_zeros((y.shape[0], 0))
+
         return PlaceHolder(X=empty_x, y=empty_y)
+
+    def get_input_dim(self):
+        """ Returns the input dimension of the extra features. """
+        return 0
 
 
 class ExtraFeatures: # To do: Check and modify
@@ -553,3 +665,21 @@ class ExtraFeatures: # To do: Check and modify
 
         else:
             raise ValueError(f"Unsupported extra feature type: {self.features_type}")
+
+    def get_input_dim(self):
+        return 1 # logp # 혹시 다른 feature를 사용하면 변경필요 # 그리고 y는 domain feature에 해당할 수도...? 그래서 이거 아닐 수도... 아무튼 이 함수는 확인 많이 필요함
+
+# Sampling utils ----------------------
+class NormalLengthDistribution:
+    def __init__(self, mean=34, std=10, min_len=10, max_len=128, device=None): # default 값은 ZINC 기준
+        self.mean = mean
+        self.std = std
+        self.min_len = min_len
+        self.max_len = max_len
+        self.device = device
+
+    def sample_n(self, n, device=None):
+        device = device or self.device
+        samples = torch.normal(self.mean, self.std, size=(n,), device=device)
+        samples = torch.clamp(samples.round(), min=self.min_len, max=self.max_len).long()
+        return samples
