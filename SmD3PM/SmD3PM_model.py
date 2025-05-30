@@ -468,8 +468,6 @@ class SmD3PM(pl.LightningModule):
         return sum_except_batch(kl_distance_X) # Batch size 제외 전체 합산
 
     def compute_Lt(self, X, y, pred, noisy_data, pad_mask, test): # to do: feature y 추가 # To do: 질문 해결하기(x_0)
-        # X = F.one_hot(X, num_classes=self.vocab_size).float().to(self.device)
-        
         pred_probs_X = F.softmax(pred.X, dim=-1).to(self.device) # pred.x_0의 logit
         has_y = pred.y is not None
         pred_probs_y = F.softmax(pred.y, dim=-1).to(self.device) if has_y else None
@@ -546,7 +544,7 @@ class SmD3PM(pl.LightningModule):
         Returns:
             nll: scalar, average NLL for the batch (nlls = -log_pN + kl_prior + loss_all_t - loss_term_0)
         """
-        X = F.one_hot(X, num_classes=self.vocab_size).float()
+        X = F.one_hot(X, num_classes=self.vocab_size).float().to(self.device)
         t = noisy_data['t'] # diffusion time t per sample
 
         # 1. Estimate log_p(N): node count log-prob
@@ -621,8 +619,8 @@ class SmD3PM(pl.LightningModule):
         pad_mask = arange < seq_lens.unsqueeze(1)
 
         # 3. Sample initial noise z_T ~ limit_dist
-        X_t = F.one_hot(torch.full((batch_size, max_len), fill_value=self.transition_model.abs_state), num_classes=self.vocab_size).float() # abs_state 호환시키기
-        y_t = torch.zeros(batch_size, 0) # To do: Modify # condition을 줄 때 y_t는 어떤 값으로 초기화할지 생각하기
+        X_t = F.one_hot(torch.full((batch_size, max_len), fill_value=self.transition_model.abs_state, device=self.device), num_classes=self.vocab_size).float() # abs_state 호환시키기
+        y_t = torch.zeros(batch_size, 0, device=self.device) # To do: Modify # condition을 줄 때 y_t는 어떤 값으로 초기화할지 생각하기
 
         # 4. Reverse sampling ### most important part
         chain_X = torch.zeros((number_chain_steps, keep_chain, max_len), dtype=torch.long, device=X_t.device)

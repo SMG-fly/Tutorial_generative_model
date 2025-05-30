@@ -3,6 +3,7 @@ import torch
 from torchmetrics import Metric, MeanSquaredError
 
 import os
+from types import SimpleNamespace
 import wandb
 import omegaconf
 
@@ -59,8 +60,8 @@ class PlaceHolder: # To do: Check And Modify argmax
 
 def setup_wandb(cfg):
     config_dict = omegaconf.OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True) # .yaml 파일을 python dict로 변환
-    kwargs = {'name': cfg.general.name, 'project': f'graph_ddm_{cfg.dataset.name}', 'config': config_dict, # wandb.init()에 전달할 설정 값
-              'settings': wandb.Settings(_disable_stats=True), 'reinit': True, 'mode': cfg.general.wandb} # wandb mode 조건부 제어 가능 # 유연성 제공
+    kwargs = {'name': cfg.general.name, 'project': f'Discrete_Diffusion_{cfg.dataset.name}', 'config': config_dict, # wandb.init()에 전달할 설정 값
+              'settings': wandb.Settings(_disable_stats=True), 'reinit': False, 'mode': cfg.general.wandb} # wandb mode 조건부 제어 가능 # 유연성 제공
     wandb.init(**kwargs)
     wandb.save('*.txt') # To do: Check whethere this is necessary # maybe memory waste
 
@@ -89,6 +90,11 @@ def move_to_device(batch, device):
         return [move_to_device(v, device) for v in batch]
     elif isinstance(batch, torch.Tensor):
         return batch.to(device)
+    elif isinstance(batch, SimpleNamespace):
+        out = SimpleNamespace()
+        for attr in vars(batch):  # batch.x, batch.y ...
+            setattr(out, attr, move_to_device(getattr(batch, attr), device))
+        return out
     elif hasattr(batch, 'to'):
         return batch.to(device)
     else:
@@ -306,8 +312,6 @@ class AbsorbingStateTransition:
         # u: 모든 state가 abs_state로 전이될 확률이 1인 행렬
         self.u = torch.zeros(1, self.num_classes, self.num_classes)
         self.u[:, :, self.abs_state] = 1 # Absorbing state만 1
-
-        print(f"[DEBUG] self.u.shape: {self.u.shape}")
 
     def get_Qt(self, beta_t):
         """ 
@@ -671,14 +675,14 @@ class ExtraFeatures: # To do: Check and modify
 
 # Sampling utils ----------------------
 class NormalLengthDistribution:
-    def __init__(self, mean=34, std=10, min_len=10, max_len=128, device=None): # default 값은 ZINC 기준
+    def __init__(self, mean=34, std=10, min_len=10, max_len=128, device='cpu'): # default 값은 ZINC 기준
         self.mean = mean
         self.std = std
         self.min_len = min_len
         self.max_len = max_len
         self.device = device
 
-    def sample_n(self, n, device=None):
+    def sample_n(self, n, device):
         device = device or self.device
         samples = torch.normal(self.mean, self.std, size=(n,), device=device)
         samples = torch.clamp(samples.round(), min=self.min_len, max=self.max_len).long()
